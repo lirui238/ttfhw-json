@@ -1,0 +1,234 @@
+name: JSON Quality Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'reports/**/*.json'
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  quality-gate:
+    name: Validate JSON Reports
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install anthropic
+
+      - name: Get changed JSON files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: reports/**/*.json
+          files_separator: ' '
+
+      - name: Skip if no JSON changes
+        if: steps.changed-files.outputs.any_changed != 'true'
+        run: |
+          echo "No JSON files changed. Skipping quality checks."
+
+      - name: Run deterministic validation
+        if: steps.changed-files.outputs.any_changed == 'true'
+        id: validate
+        run: |
+          python3 scripts/validate_json.py ${{ steps.changed-files.outputs.all_changed_files }} > /tmp/deterministic_results.json
+          cat /tmp/deterministic_results.json
+
+      - name: Run AI semantic analysis
+        if: steps.changed-files.outputs.any_changed == 'true'
+        id: ai-check
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 scripts/ai_quality_check.py ${{ steps.changed-files.outputs.all_changed_files }} > /tmp/ai_results.json
+          cat /tmp/ai_results.json
+
+      - name: Post results as Check Run and PR comment
+        if: steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Read deterministic results
+            let detResults = { pass: true, files: {} };
+            try {
+              detResults = JSON.parse(fs.readFileSync('/tmp/deterministic_results.json', 'utf8'));
+            } catch (e) {
+              console.log('Failed to read deterministic results:', e.message);
+            }
+
+            // Read AI results (may not exist)
+            let aiResults = { pass: true, files: {} };
+            try {
+              aiResults = JSON.parse(fs.readFileSync('/tmp/ai_results.json', 'utf8'));
+            } catch (e) {
+              console.log('AI results not available:', e.message);
+            }
+
+            // Merge all issues
+            const allFiles = new Set();
+            for (const f of Object.keys(detResults.files)) allFiles.add(f);
+            for (const f of Object.keys(aiResults.files)) allFiles.add(f);
+
+            const findings = {};
+            let totalErrors = 0;
+            let totalWarnings = 0;
+            let totalNotices = 0;
+            const annotations = [];
+
+            for (const file of allFiles) {
+              findings[file] = [];
+              const df = detResults.files[file] || { issues: [] };
+              const af = aiResults.files[file] || { issues: [] };
+
+              for (const issue of [...df.issues, ...af.issues]) {
+                findings[file].push(issue);
+                if (issue.severity === 'error') totalErrors++;
+                else if (issue.severity === 'warning') totalWarnings++;
+                else totalNotices++;
+
+                // Create check run annotation
+                const annotation = {
+                  path: file,
+                  annotation_level: issue.severity === 'error' ? 'failure' :
+                                    issue.severity === 'warning' ? 'warning' : 'notice',
+                  title: issue.path || '$',
+                  message: issue.message,
+                  raw_details: issue.suggestion || '',
+                };
+                annotations.push(annotation);
+              }
+            }
+
+            // Create Check Run
+            const conclusion = totalErrors > 0 ? 'failure' :
+                              totalWarnings > 0 ? 'neutral' : 'success';
+
+            const checkTitle = totalErrors + totalWarnings + totalNotices > 0
+              ? `${totalErrors} errors, ${totalWarnings} warnings, ${totalNotices} notices`
+              : 'All checks passed';
+
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'JSON Quality Gate',
+              head_sha: context.payload.pull_request.head.sha,
+              status: 'completed',
+              conclusion: conclusion,
+              completed_at: new Date().toISOString(),
+              output: {
+                title: checkTitle,
+                summary: `Checked ${allFiles.size} file(s) for JSON quality issues.\n\n` +
+                         `- **Deterministic checks**: ${Object.keys(detResults.files).length} file(s)\n` +
+                         `- **AI analysis**: ${Object.keys(aiResults.files).length} file(s)${aiResults.error ? ' (partially available)' : ''}\n\n` +
+                         `This is an **advisory** gate — findings do not block merging.`,
+                annotations: annotations.slice(0, 50),  // GitHub limits to 50 per check run
+              },
+            });
+
+            // Build PR comment
+            let commentBody = '## 🔍 JSON Quality Gate Results\n\n';
+            commentBody += `**${allFiles.size} file(s) checked** | `;
+
+            const parts = [];
+            if (totalErrors > 0) parts.push(`🚫 ${totalErrors} errors`);
+            if (totalWarnings > 0) parts.push(`⚠️ ${totalWarnings} warnings`);
+            if (totalNotices > 0) parts.push(`ℹ️ ${totalNotices} notices`);
+
+            if (parts.length === 0) {
+              commentBody += '✅ All checks passed';
+            } else {
+              commentBody += parts.join(' | ');
+            }
+            commentBody += '\n\n';
+
+            for (const [file, fileIssues] of Object.entries(findings)) {
+              if (fileIssues.length === 0) continue;
+
+              const fileName = file.replace(/^reports\//, '');
+              commentBody += `### 📄 ${fileName}\n\n`;
+
+              // Group by severity
+              const errors = fileIssues.filter(i => i.severity === 'error');
+              const warnings = fileIssues.filter(i => i.severity === 'warning');
+              const notices = fileIssues.filter(i => i.severity === 'notice');
+
+              if (errors.length > 0) {
+                commentBody += `**🚫 Errors (${errors.length})**\n`;
+                for (const e of errors.slice(0, 10)) {
+                  commentBody += `- **${e.path}**: ${e.message}\n`;
+                  if (e.suggestion) commentBody += `  > 💡 ${e.suggestion}\n`;
+                }
+                if (errors.length > 10) commentBody += `  > ... and ${errors.length - 10} more\n`;
+                commentBody += '\n';
+              }
+
+              if (warnings.length > 0) {
+                commentBody += `**⚠️ Warnings (${warnings.length})**\n`;
+                for (const w of warnings.slice(0, 10)) {
+                  commentBody += `- **${w.path}**: ${w.message}\n`;
+                  if (w.suggestion) commentBody += `  > 💡 ${w.suggestion}\n`;
+                }
+                if (warnings.length > 10) commentBody += `  > ... and ${warnings.length - 10} more\n`;
+                commentBody += '\n';
+              }
+
+              if (notices.length > 0 && notices.length <= 5) {
+                commentBody += `**ℹ️ Notices (${notices.length})**\n`;
+                for (const n of notices) {
+                  commentBody += `- **${n.path}**: ${n.message}\n`;
+                }
+                commentBody += '\n';
+              }
+            }
+
+            commentBody += '---\n';
+            commentBody += '🤖 Generated by [JSON Quality Gate]' +
+              `(https://github.com/${context.repo.owner}/${context.repo.repo}/actions)\n`;
+            commentBody += 'ℹ️ This is an **advisory** check — findings do not block merging.';
+
+            // Find and update existing comment, or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.body.includes('JSON Quality Gate Results') &&
+              c.user.type === 'Bot'
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: commentBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: commentBody,
+              });
+            }
